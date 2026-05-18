@@ -20,9 +20,11 @@ import { AIResponder } from './aiResponder';
 import { ConversationState } from './conversationState';
 import {
   ChatbotConfig,
-  ConversationSession,
+  ConversationRepository,
   IncomingMessagePayload,
   MenuOption,
+  PersistedConversationSession,
+  PersistedIncomingMessagePayload,
 } from './types';
 import { sendTextMessage } from './waBridge';
 
@@ -43,37 +45,38 @@ const MENU_MESSAGE = [
 ].join('\n');
 const OPTOUT_MESSAGE =
   'Tudo bem, não vou continuar o atendimento automático por aqui.';
+const MENU_SENT_OPTION = 'menu_sent';
 
 const MENU_OPTIONS: MenuOption[] = [
   {
     id: 'products',
     keywords: ['1', 'comprar', 'produto', 'produtos', 'ver produtos'],
     label: 'Comprar / Ver produtos',
-    status: 'llm_support',
+    status: 'pending',
   },
   {
     id: 'order',
     keywords: ['2', 'pedido', 'consultar pedido'],
     label: 'Consultar pedido',
-    status: 'llm_support',
+    status: 'pending',
   },
   {
     id: 'returns',
     keywords: ['3', 'troca', 'trocas', 'devolucao', 'devolucoes'],
     label: 'Trocas e devoluções',
-    status: 'llm_support',
+    status: 'pending',
   },
   {
     id: 'support',
     keywords: ['4', 'suporte', 'duvida', 'ajuda'],
     label: 'Falar com suporte',
-    status: 'llm_support',
+    status: 'pending',
   },
   {
     id: 'human',
     keywords: ['5', 'humano', 'atendente'],
     label: 'Falar com atendente',
-    status: 'waiting_human',
+    status: 'open',
   },
 ];
 
@@ -83,18 +86,24 @@ export class MessageRouter {
   constructor(
     private readonly page: playwright.Page,
     private readonly config: ChatbotConfig,
-    private readonly responder: AIResponder
+    private readonly responder: AIResponder,
+    private readonly repository: ConversationRepository
   ) {
     this.state = new ConversationState(config.debounceMs, config.sessionTtlMs);
   }
 
-  route(payload: IncomingMessagePayload): void {
+  async route(payload: IncomingMessagePayload): Promise<void> {
     if (!this.shouldHandle(payload)) {
       return;
     }
 
-    this.state.markProcessed(payload.messageId);
-    this.state.enqueue(payload, (messages) => {
+    const persisted = await this.repository.ingestInboundMessage(payload);
+
+    if (!persisted) {
+      return;
+    }
+
+    this.state.enqueue(persisted, (messages) => {
       this.respond(messages).catch((error) => {
         console.error('Failed to respond to chat:', messages[0].chatId, error);
       });
@@ -106,7 +115,7 @@ export class MessageRouter {
       return false;
     }
 
-    if (this.state.isProcessed(payload.messageId) || payload.fromMe) {
+    if (payload.fromMe) {
       return false;
     }
 
@@ -124,7 +133,9 @@ export class MessageRouter {
     return payload.type === 'chat' && Boolean(payload.body.trim());
   }
 
-  private async respond(messages: IncomingMessagePayload[]): Promise<void> {
+  private async respond(
+    messages: PersistedIncomingMessagePayload[]
+  ): Promise<void> {
     const chatId = messages[0].chatId;
 
     if (this.state.isActive(chatId)) {
@@ -134,13 +145,18 @@ export class MessageRouter {
     this.state.setActive(chatId, true);
 
     try {
-      this.state.appendMessages(chatId, messages);
+      const session = await this.repository.getConversation(
+        messages[0].conversationId
+      );
 
-      const session = this.state.getOrCreateSession(chatId);
+      if (!session) {
+        return;
+      }
+
       await this.respondByState(session, messages);
     } catch (error) {
       console.error('Chatbot response error:', error);
-      await this.sendAndTrack(chatId, FALLBACK_MESSAGE);
+      await this.sendAndTrack(messages[0], FALLBACK_MESSAGE);
     } finally {
       this.state.setActive(chatId, false);
       const queuedMessages = this.state.consumeQueued(chatId);
@@ -152,124 +168,110 @@ export class MessageRouter {
   }
 
   private async respondByState(
-    session: ConversationSession,
-    messages: IncomingMessagePayload[]
+    session: PersistedConversationSession,
+    messages: PersistedIncomingMessagePayload[]
   ): Promise<void> {
     const content = this.normalizeContent(messages);
 
+    if (session.status === 'open') {
+      return;
+    }
+
     if (this.matchesAny(content, this.config.optOutKeywords)) {
-      this.state.markOptOut(session.chatId);
-      await this.sendAndTrack(session.chatId, OPTOUT_MESSAGE);
+      await this.repository.markContactOptedOut(session.contactId);
+      await this.sendAndTrack(session, OPTOUT_MESSAGE);
       return;
     }
 
     if (this.matchesAny(content, this.config.humanKeywords)) {
-      await this.transferToHuman(session.chatId, 'customer_requested_human');
+      await this.transferToHuman(session, 'customer_requested_human');
       return;
     }
 
-    if (session.status === 'opted_out') {
-      return;
-    }
-
-    if (
-      session.status === 'waiting_human' ||
-      session.status === 'human_in_progress'
-    ) {
-      return;
-    }
-
-    if (session.status === 'resolved' && !this.state.isExpired(session)) {
-      return;
-    }
-
-    if (session.status === 'resolved' && this.state.isExpired(session)) {
-      this.state.setStatus(session.chatId, 'new', 'session_expired');
-    }
-
-    if (session.status === 'new') {
+    if (!session.selectedMenuOption) {
       if (this.config.menuEnabled) {
-        this.state.setStatus(
-          session.chatId,
-          'waiting_menu_choice',
-          'menu_sent'
+        await this.repository.setSelectedMenuOption(
+          session.id,
+          MENU_SENT_OPTION
         );
-        await this.sendAndTrack(session.chatId, MENU_MESSAGE);
+        await this.sendAndTrack(session, MENU_MESSAGE);
         return;
       }
 
-      this.state.setStatus(session.chatId, 'llm_support', 'menu_disabled');
+      await this.repository.setSelectedMenuOption(session.id, 'menu_disabled');
+      session.selectedMenuOption = 'menu_disabled';
     }
 
-    if (session.status === 'waiting_menu_choice') {
+    if (session.selectedMenuOption === MENU_SENT_OPTION) {
       await this.handleMenuChoice(session, messages, content);
       return;
     }
 
-    if (session.status === 'llm_support') {
-      await this.handleLlmSupport(session, messages);
-    }
+    await this.handleLlmSupport(session, messages);
   }
 
   private async handleMenuChoice(
-    session: ConversationSession,
-    messages: IncomingMessagePayload[],
+    session: PersistedConversationSession,
+    messages: PersistedIncomingMessagePayload[],
     content: string
   ): Promise<void> {
     if (content === 'menu' || content === 'voltar') {
-      await this.sendAndTrack(session.chatId, MENU_MESSAGE);
+      await this.sendAndTrack(session, MENU_MESSAGE);
       return;
     }
 
     const option = this.findMenuOption(content);
 
-    if (option?.status === 'waiting_human') {
-      this.state.setSelectedMenuOption(session.chatId, option.id);
-      await this.transferToHuman(session.chatId, 'menu_human_option');
+    if (option?.status === 'open') {
+      await this.repository.setSelectedMenuOption(session.id, option.id);
+      await this.transferToHuman(session, 'menu_human_option');
       return;
     }
 
-    if (option?.status === 'llm_support' || this.looksLikeQuestion(content)) {
-      this.state.setSelectedMenuOption(
-        session.chatId,
+    if (option?.status === 'pending' || this.looksLikeQuestion(content)) {
+      await this.repository.setSelectedMenuOption(
+        session.id,
         option?.id || 'direct_question'
       );
-      this.state.setStatus(session.chatId, 'llm_support', 'menu_to_llm');
-      await this.handleLlmSupport(session, messages);
+      await this.handleLlmSupport(
+        {
+          ...session,
+          selectedMenuOption: option?.id || 'direct_question',
+        },
+        messages
+      );
       return;
     }
 
     await this.sendAndTrack(
-      session.chatId,
+      session,
       `Não entendi a opção. Por favor, escolha uma das opções abaixo:\n\n${MENU_MESSAGE}`
     );
   }
 
   private async handleLlmSupport(
-    session: ConversationSession,
-    messages: IncomingMessagePayload[]
+    session: PersistedConversationSession,
+    messages: PersistedIncomingMessagePayload[]
   ): Promise<void> {
     try {
       const response = await this.responder.respond(
         messages,
-        this.config.model
+        this.config.model,
+        session
       );
 
       if (response.needsHuman) {
         await this.transferToHuman(
-          session.chatId,
+          session,
           response.reason || 'llm_requested_human'
         );
         return;
       }
 
-      await this.sendAndTrack(
-        session.chatId,
-        response.text || FALLBACK_MESSAGE
-      );
+      await this.sendAndTrack(session, response.text || FALLBACK_MESSAGE);
     } catch (error) {
       console.error('Chatbot LLM error:', error);
-      await this.transferToHuman(session.chatId, 'llm_error');
+      await this.transferToHuman(session, 'llm_error');
     }
   }
 
@@ -294,13 +296,29 @@ export class MessageRouter {
       .join(' ');
   }
 
-  private async sendAndTrack(chatId: string, message: string): Promise<void> {
-    await sendTextMessage(this.page, chatId, message);
-    this.state.markBotMessage(chatId);
+  private async sendAndTrack(
+    target: PersistedConversationSession | PersistedIncomingMessagePayload,
+    message: string
+  ): Promise<void> {
+    await sendTextMessage(this.page, target.chatId, message);
+    await this.repository.recordOutboundMessage({
+      body: message,
+      chatId: target.chatId,
+      contactId: target.contactId,
+      conversationId:
+        'conversationId' in target ? target.conversationId : target.id,
+    });
   }
 
-  private async transferToHuman(chatId: string, reason: string): Promise<void> {
-    this.state.markHumanHandoff(chatId, reason);
-    await this.sendAndTrack(chatId, HUMAN_HANDOFF_MESSAGE);
+  private async transferToHuman(
+    session: PersistedConversationSession,
+    reason: string
+  ): Promise<void> {
+    const updated = await this.repository.transitionConversation({
+      conversationId: session.id,
+      reason,
+      toStatus: 'open',
+    });
+    await this.sendAndTrack(updated, HUMAN_HANDOFF_MESSAGE);
   }
 }

@@ -19,8 +19,12 @@ import 'dotenv/config';
 import { getPage } from '../browser';
 import { AIResponder } from './aiResponder';
 import { loadConfig } from './config';
+import { createDatabasePool } from './database';
+import { startBackgroundInventorySync } from './inventorySync';
 import { MessageRouter } from './messageRouter';
-import { StockClient } from './stockClient';
+import { PostgresConversationRepository } from './postgresConversationRepository';
+import { ProductInventoryRepository } from './productInventoryRepository';
+import { ProductInventorySearch } from './productInventorySearch';
 import { registerMessageListener } from './waBridge';
 
 async function start() {
@@ -30,6 +34,10 @@ async function start() {
     throw new Error('Missing OPENAI_API_KEY environment variable');
   }
 
+  if (!config.databaseUrl) {
+    throw new Error('Missing DATABASE_URL environment variable');
+  }
+
   const args = process.argv.slice(2);
   const { page } = await getPage({
     headless: false,
@@ -37,12 +45,22 @@ async function start() {
     args,
   });
 
-  const stockClient = new StockClient(config.stockApiUrl);
-  const responder = new AIResponder(config, stockClient);
-  const router = new MessageRouter(page, config, responder);
+  const pool = createDatabasePool(config.databaseUrl);
+  const repository = new PostgresConversationRepository(
+    pool,
+    config.sessionTtlMs
+  );
+  const inventoryRepository = new ProductInventoryRepository(pool);
+  const inventorySearch = new ProductInventorySearch(
+    inventoryRepository,
+    config.productSearchLimit
+  );
+  startBackgroundInventorySync(config, inventoryRepository);
+  const responder = new AIResponder(config, inventorySearch, repository);
+  const router = new MessageRouter(page, config, responder, repository);
 
   await registerMessageListener(page, async (payload) => {
-    router.route(payload);
+    await router.route(payload);
   });
 
   console.log('WA-JS chatbot started. Waiting for WhatsApp messages...');

@@ -16,25 +16,42 @@
 
 export interface ChatbotConfig {
   allowedChats: Set<string>;
+  databaseUrl?: string;
   debounceMs: number;
   humanKeywords: string[];
   ignoreGroups: boolean;
+  inventorySyncEnabled: boolean;
+  inventorySyncIntervalMinutes: number;
+  mercadoLivre: MercadoLivreConfig;
   menuEnabled: boolean;
   model: string;
   openAIApiKey?: string;
   optOutKeywords: string[];
+  productSearchLimit: number;
+  shopify: ShopifyConfig;
   sessionTtlMs: number;
-  stockApiUrl?: string;
+  templateProductReplies: boolean;
 }
 
-export type ConversationStatus =
-  | 'new'
-  | 'waiting_menu_choice'
-  | 'llm_support'
-  | 'waiting_human'
-  | 'human_in_progress'
-  | 'resolved'
-  | 'opted_out';
+export type Marketplace = 'mercado_livre' | 'shopify';
+
+export interface MercadoLivreConfig {
+  accessToken?: string;
+  clientId?: string;
+  clientSecret?: string;
+  enabled: boolean;
+  refreshToken?: string;
+  sellerId?: string;
+}
+
+export interface ShopifyConfig {
+  adminAccessToken?: string;
+  apiVersion: string;
+  enabled: boolean;
+  shopDomain?: string;
+}
+
+export type ConversationStatus = 'pending' | 'open' | 'resolved';
 
 export interface ConversationTransition {
   from: ConversationStatus;
@@ -59,6 +76,12 @@ export interface ConversationSession {
   updatedAt: number;
 }
 
+export interface PersistedConversationSession extends ConversationSession {
+  contactId: number;
+  expiresAt?: number;
+  id: number;
+}
+
 export interface IncomingMessagePayload {
   body: string;
   chatId: string;
@@ -69,6 +92,12 @@ export interface IncomingMessagePayload {
   timestamp?: number;
   to?: string;
   type?: string;
+}
+
+export interface PersistedIncomingMessagePayload extends IncomingMessagePayload {
+  contactId: number;
+  conversationId: number;
+  dbMessageId: number;
 }
 
 export interface MenuOption {
@@ -87,13 +116,99 @@ export interface ProductLookupResult {
   sizes?: string[];
 }
 
+export interface ProductInventorySearchItem {
+  availableQuantity: number;
+  color?: string;
+  lastSyncedAt: string;
+  marketplace: Marketplace;
+  price?: string;
+  sku?: string;
+  title: string;
+  url?: string;
+  variant?: string;
+}
+
+export interface ProductInventorySearchResult {
+  marketplace?: Marketplace;
+  query: string;
+  results: ProductInventorySearchItem[];
+}
+
 export interface AIResponse {
   needsHuman: boolean;
   reason?: string;
   text: string;
 }
 
+export interface LlmStartedInput {
+  conversationId: number;
+  messageId?: number;
+  model: string;
+  promptSummary?: string;
+  requestPayload?: unknown;
+}
+
+export interface LlmSucceededInput {
+  completionTokens?: number;
+  id: number;
+  latencyMs?: number;
+  promptTokens?: number;
+  requestPayload?: unknown;
+  responsePayload?: unknown;
+  responseText?: string;
+  totalTokens?: number;
+}
+
+export interface LlmFailedInput {
+  errorMessage: string;
+  id: number;
+  latencyMs?: number;
+}
+
+export interface OutboundMessageInput {
+  body: string;
+  chatId: string;
+  contactId: number;
+  conversationId: number;
+  messageType?: string;
+  rawPayload?: unknown;
+  senderType?: 'bot' | 'agent' | 'system';
+  waMessageId?: string;
+}
+
+export interface ToolCallInput {
+  conversationId: number;
+  errorMessage?: string;
+  latencyMs?: number;
+  llmCallId?: number;
+  requestPayload?: unknown;
+  responsePayload?: unknown;
+  status: 'started' | 'succeeded' | 'failed';
+  toolName: string;
+}
+
+export interface TransitionInput {
+  conversationId: number;
+  metadata?: unknown;
+  reason: string;
+  toStatus: ConversationStatus;
+}
+
 export interface ConversationRepository {
-  get(chatId: string): Promise<ConversationSession | undefined>;
-  save(session: ConversationSession): Promise<void>;
+  getConversation(
+    conversationId: number
+  ): Promise<PersistedConversationSession | undefined>;
+  ingestInboundMessage(
+    payload: IncomingMessagePayload
+  ): Promise<PersistedIncomingMessagePayload | undefined>;
+  markContactOptedOut(contactId: number): Promise<void>;
+  recordLlmFailed(input: LlmFailedInput): Promise<void>;
+  recordLlmStarted(input: LlmStartedInput): Promise<number>;
+  recordLlmSucceeded(input: LlmSucceededInput): Promise<void>;
+  recordOutboundMessage(input: OutboundMessageInput): Promise<void>;
+  recordToolCall(input: ToolCallInput): Promise<void>;
+  setSelectedMenuOption(conversationId: number, option: string): Promise<void>;
+  transitionConversation(
+    input: TransitionInput
+  ): Promise<PersistedConversationSession>;
 }

@@ -14,100 +14,25 @@
  * limitations under the License.
  */
 
-import {
-  ConversationSession,
-  ConversationStatus,
-  IncomingMessagePayload,
-} from './types';
+import { ConversationSession, PersistedIncomingMessagePayload } from './types';
 
 interface PendingConversation {
-  messages: IncomingMessagePayload[];
+  messages: PersistedIncomingMessagePayload[];
   timer?: NodeJS.Timeout;
 }
 
 export class ConversationState {
   private readonly activeChats = new Set<string>();
-  private readonly processedMessages = new Set<string>();
-  private readonly queuedMessages = new Map<string, IncomingMessagePayload[]>();
+  private readonly queuedMessages = new Map<
+    string,
+    PersistedIncomingMessagePayload[]
+  >();
   private readonly pendingChats = new Map<string, PendingConversation>();
-  private readonly sessions = new Map<string, ConversationSession>();
 
   constructor(
     private readonly debounceMs: number,
     private readonly sessionTtlMs: number
   ) {}
-
-  appendMessages(chatId: string, messages: IncomingMessagePayload[]): void {
-    const session = this.getOrCreateSession(chatId);
-    const now = Date.now();
-
-    session.recentMessages.push(...messages);
-    session.recentMessages = session.recentMessages.slice(-20);
-    session.lastCustomerMessageAt = now;
-    session.updatedAt = now;
-  }
-
-  getOrCreateSession(chatId: string): ConversationSession {
-    const session = this.sessions.get(chatId);
-
-    if (session) {
-      return session;
-    }
-
-    const now = Date.now();
-    const newSession: ConversationSession = {
-      chatId,
-      createdAt: now,
-      recentMessages: [],
-      status: 'new',
-      transitions: [],
-      updatedAt: now,
-    };
-
-    this.sessions.set(chatId, newSession);
-
-    return newSession;
-  }
-
-  isProcessed(messageId: string): boolean {
-    return this.processedMessages.has(messageId);
-  }
-
-  markProcessed(messageId: string): void {
-    this.processedMessages.add(messageId);
-  }
-
-  markBotMessage(chatId: string): void {
-    const session = this.getOrCreateSession(chatId);
-    const now = Date.now();
-
-    session.lastBotMessageAt = now;
-    session.updatedAt = now;
-  }
-
-  markHumanHandoff(chatId: string, reason: string): ConversationSession {
-    const session = this.setStatus(chatId, 'waiting_human', reason);
-
-    session.handoffReason = reason;
-
-    return session;
-  }
-
-  markResolved(chatId: string, reason = 'resolved'): ConversationSession {
-    const session = this.setStatus(chatId, 'resolved', reason);
-
-    session.resolvedAt = Date.now();
-
-    return session;
-  }
-
-  markOptOut(chatId: string, reason = 'opt_out'): ConversationSession {
-    const session = this.setStatus(chatId, 'opted_out', reason);
-
-    session.optOutAt = Date.now();
-
-    return session;
-  }
 
   isExpired(session: ConversationSession): boolean {
     const lastActivity = session.lastCustomerMessageAt || session.updatedAt;
@@ -128,40 +53,7 @@ export class ConversationState {
     this.activeChats.delete(chatId);
   }
 
-  setSelectedMenuOption(chatId: string, option: string): void {
-    const session = this.getOrCreateSession(chatId);
-
-    session.selectedMenuOption = option;
-    session.updatedAt = Date.now();
-  }
-
-  setStatus(
-    chatId: string,
-    status: ConversationStatus,
-    reason: string
-  ): ConversationSession {
-    const session = this.getOrCreateSession(chatId);
-
-    if (session.status === status) {
-      session.updatedAt = Date.now();
-      return session;
-    }
-
-    const now = Date.now();
-
-    session.transitions.push({
-      from: session.status,
-      reason,
-      timestamp: now,
-      to: status,
-    });
-    session.status = status;
-    session.updatedAt = now;
-
-    return session;
-  }
-
-  consumeQueued(chatId: string): IncomingMessagePayload[] {
+  consumeQueued(chatId: string): PersistedIncomingMessagePayload[] {
     const queued = this.queuedMessages.get(chatId) || [];
 
     this.queuedMessages.delete(chatId);
@@ -170,8 +62,8 @@ export class ConversationState {
   }
 
   enqueue(
-    payload: IncomingMessagePayload,
-    onReady: (messages: IncomingMessagePayload[]) => void
+    payload: PersistedIncomingMessagePayload,
+    onReady: (messages: PersistedIncomingMessagePayload[]) => void
   ): void {
     const pending = this.pendingChats.get(payload.chatId) || { messages: [] };
 
